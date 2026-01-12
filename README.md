@@ -5,7 +5,7 @@
 A high-performance, smart media gallery card for Home Assistant.
 Built to handle large camera archives and specifically designed to **eliminate corrupt "Zombie" recording files** automatically.
 
-![Preview](https://via.placeholder.com/600x300.png?text=MarvGallery+Preview)
+![Preview](preview.png)
 
 ## 🎯 The Problem it Solves
 
@@ -111,4 +111,5 @@ hide_home: false
 
 ## ❤️ Credits
 Developed by **MrMarv89**.
+
 Based on concepts from the original Media Explorer Card, but rewritten for stability and smart filtering.
