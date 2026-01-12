@@ -1,13 +1,12 @@
 /**
- * MarvGallery Card v1.1.3
+ * MarvGallery Card v1.1.4
  * Created by MrMarv89
  * * Description:
  * A high-performance media gallery for Home Assistant.
- * * Changelog v1.1.3:
- * - FIX: Interaction Lock. Auto-Refresh is paused for 30 seconds after user interaction (Load More, Click, etc.)
- * to prevent UI overlap/glitches while browsing.
- * - FIX: "Load More" now smoothly integrates with the queue system.
- * - PREVIOUS: Includes all mobile performance fixes (Queue, Refresh-Blocker, Timeout-Safety).
+ * * Changelog v1.1.4:
+ * - NEW: "Hybrid Queue System". PC automatically uses 3 concurrent workers (fast), Mobile uses 1 (safe).
+ * - NEW: "Mobile Low Resource Mode" (Config Option). If enabled, disables pixel/corruption checks on mobile devices only for instant loading.
+ * - FIX: Interaction Lock maintained from v1.1.3.
  */
 
 import { LitElement, html, css } from "https://unpkg.com/lit-element@2.5.1/lit-element.js?module";
@@ -54,7 +53,9 @@ const TEXTS = {
     config_hide_refresh: "Hide 'Refresh' in menu",
     config_hide_sort: "Hide 'Sort' in menu",
     config_hide_load: "Hide 'Load More' in menu",
-    config_lang: "UI Language"
+    config_lang: "UI Language",
+    config_mobile_opt: "Mobile: Disable Smart Filter (Faster)",
+    config_mobile_opt_help: "On Mobile: Loads thumbnails instantly but might show black/corrupt files. PC keeps filtering."
   },
   de: {
     load_more: "Mehr laden",
@@ -96,7 +97,9 @@ const TEXTS = {
     config_hide_refresh: "Verstecke 'Neu laden' im Menü",
     config_hide_sort: "Verstecke 'Sortierung' im Menü",
     config_hide_load: "Verstecke 'Mehr laden' im Menü",
-    config_lang: "Sprache (UI)"
+    config_lang: "Sprache (UI)",
+    config_mobile_opt: "Mobile: Smart Filter aus (Performance)",
+    config_mobile_opt_help: "Am Handy: Lädt sofort, prüft aber nicht auf schwarze Videos. PC prüft weiterhin."
   }
 };
 
@@ -133,7 +136,8 @@ class MarvGalleryCard extends LitElement {
       filter_broken: true,
       filter_darkness_threshold: 10,
       show_hidden_count: true,
-      ui_language: "en"
+      ui_language: "en",
+      mobile_low_resource: false
     }
   }
 
@@ -221,10 +225,9 @@ class MarvGalleryCard extends LitElement {
     this._refreshTimer = null;
     this._hiddenCount = 0;
     
-    this._processingQueue = false;
+    // QUEUE SYSTEM
+    this._activeWorkers = 0;
     this._queueList = [];
-    
-    // V1.1.3: User Interaction Timestamp
     this._lastInteraction = 0;
   }
 
@@ -259,6 +262,7 @@ class MarvGalleryCard extends LitElement {
       filter_darkness_threshold: 10,
       show_hidden_count: true,
       ui_language: "en",
+      mobile_low_resource: false,
       ...config
     };
     this._currentLimit = parseInt(this.config.maximum_files);
@@ -270,6 +274,11 @@ class MarvGalleryCard extends LitElement {
   get t() {
       const lang = this.config.ui_language || "en";
       return TEXTS[lang] || TEXTS["en"];
+  }
+
+  // DETECTION: Check if we are on a mobile device
+  get _isMobile() {
+    return /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
   }
 
   connectedCallback() {
@@ -287,17 +296,8 @@ class MarvGalleryCard extends LitElement {
     const interval = parseInt(this.config.auto_refresh_interval);
     if (interval > 0) {
       this._refreshTimer = setInterval(() => {
-        // V1.1.3 FIX: User Interaction check
-        // If user interacted in last 30 seconds, pause refresh.
-        if (Date.now() - this._lastInteraction < 30000) {
-            // console.log("Skipping refresh due to user interaction");
-            return;
-        }
-
-        // V1.1.2 FIX: Queue check
-        if (this._processingQueue || this._queueList.length > 0 || this._playingItem) {
-            return;
-        }
+        if (Date.now() - this._lastInteraction < 30000) return;
+        if (this._activeWorkers > 0 || this._queueList.length > 0 || this._playingItem) return;
 
         if (this._history.length === 0) {
            this._loadMedia(null, true, true);
@@ -379,7 +379,6 @@ class MarvGalleryCard extends LitElement {
         if(!this.config.title) title = result.title;
       }
 
-      // STATE MERGE
       if (forceRefresh && this._mediaEvents && this._mediaEvents.children) {
           const oldMap = new Map(this._mediaEvents.children.map(i => [i.media_content_id, i]));
           children = children.map(newChild => {
@@ -481,6 +480,12 @@ class MarvGalleryCard extends LitElement {
   }
 
   _checkVideoValidity(url, threshold) {
+      // LOW RESOURCE MODE CHECK:
+      // If enabled AND we are on mobile, skip the pixel check.
+      if (this.config.mobile_low_resource && this._isMobile) {
+          return Promise.resolve(false); // Assume valid
+      }
+
       return new Promise((resolve) => {
           const video = document.createElement('video');
           video.muted = true;
@@ -504,10 +509,7 @@ class MarvGalleryCard extends LitElement {
               } catch(e) { return false; }
           };
 
-          const metaTimer = setTimeout(() => {
-              video.src = "";
-              resolve(false); 
-          }, 5000);
+          const metaTimer = setTimeout(() => { video.src = ""; resolve(false); }, 5000);
 
           video.onloadedmetadata = () => {
              clearTimeout(metaTimer);
@@ -531,11 +533,10 @@ class MarvGalleryCard extends LitElement {
       });
   }
 
-  // --- QUEUE SYSTEM ---
+  // --- HYBRID QUEUE SYSTEM ---
   _planQueueCheck() {
       if (!this.config.enablePreview) return;
-      if (this._processingQueue) return;
-
+      
       const visible = this._getVisibleItems();
       
       this._queueList = visible.filter(item => {
@@ -558,15 +559,24 @@ class MarvGalleryCard extends LitElement {
   }
 
   async _processQueue() {
-      if (this._processingQueue || this._queueList.length === 0) {
-          this._processingQueue = false;
+      // Determine Max Concurrency
+      // PC = 3, Mobile = 1
+      const maxConcurrent = this._isMobile ? 1 : 3;
+
+      if (this._activeWorkers >= maxConcurrent || this._queueList.length === 0) {
           return;
       }
-      
-      this._processingQueue = true;
-      const item = this._queueList.shift(); 
-      const threshold = this.config.filter_darkness_threshold !== undefined ? parseInt(this.config.filter_darkness_threshold) : 10;
 
+      // Spawn workers until maxConcurrent is reached or queue is empty
+      while (this._activeWorkers < maxConcurrent && this._queueList.length > 0) {
+          const item = this._queueList.shift();
+          this._runWorker(item);
+      }
+  }
+
+  async _runWorker(item) {
+      this._activeWorkers++;
+      const threshold = this.config.filter_darkness_threshold !== undefined ? parseInt(this.config.filter_darkness_threshold) : 10;
       const sourceItem = this._mediaEvents.children.find(c => c.media_content_id === item.media_content_id);
       
       if (sourceItem) {
@@ -586,8 +596,8 @@ class MarvGalleryCard extends LitElement {
                       sourceItem.is_broken = true;
                       this.requestUpdate().then(() => {
                            setTimeout(() => {
-                               this._processingQueue = false;
-                               this._planQueueCheck(); 
+                               this._activeWorkers--;
+                               this._planQueueCheck(); // Retrigger
                            }, 50);
                       });
                       return; 
@@ -604,9 +614,10 @@ class MarvGalleryCard extends LitElement {
       }
 
       this.requestUpdate();
+      
       setTimeout(() => {
-          this._processingQueue = false;
-          this._planQueueCheck();
+          this._activeWorkers--;
+          this._planQueueCheck(); // Next please
       }, 50);
   }
 
@@ -633,7 +644,7 @@ class MarvGalleryCard extends LitElement {
   }
 
   _handleItemClick(item) {
-    this._lastInteraction = Date.now(); // Interaction!
+    this._lastInteraction = Date.now();
     if (item.can_expand) {
       this._history.push(this._mediaEvents);
       this._currentLimit = parseInt(this.config.maximum_files);
@@ -658,12 +669,12 @@ class MarvGalleryCard extends LitElement {
   }
 
   _toggleMenu() { 
-      this._lastInteraction = Date.now(); // Interaction!
+      this._lastInteraction = Date.now();
       this._menuOpen = !this._menuOpen; 
   }
   
   _menuAction(action) {
-    this._lastInteraction = Date.now(); // Interaction!
+    this._lastInteraction = Date.now();
     this._menuOpen = false;
     if (action === 'refresh') { 
         MarvGalleryCard._internalCache.clear(); 
@@ -675,7 +686,7 @@ class MarvGalleryCard extends LitElement {
   }
 
   _increaseLimit() {
-      this._lastInteraction = Date.now(); // Interaction!
+      this._lastInteraction = Date.now();
       const step = parseInt(this.config.load_more_count) || 10;
       this._currentLimit += step;
   }
@@ -895,6 +906,13 @@ class MarvGalleryEditor extends LitElement {
            <input type="number" min="0" max="255" .value=${val('filter_darkness_threshold', 10)} configValue="filter_darkness_threshold" @input=${this._valueChanged}>
            <div class="help">${T.config_threshold_help}</div>
         </div>
+
+        <div class="group-header">Performance & Mobile</div>
+        <div class="option checkbox">
+          <input type="checkbox" .checked=${bool('mobile_low_resource')} configValue="mobile_low_resource" @change=${this._valueChanged}>
+          <label>${T.config_mobile_opt}</label>
+        </div>
+        <div class="help" style="margin-left: 24px;">${T.config_mobile_opt_help}</div>
 
         <div class="group-header">${T.config_group_layout}</div>
         <div class="row">
