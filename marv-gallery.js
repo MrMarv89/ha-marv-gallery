@@ -1,13 +1,13 @@
 /**
- * MarvGallery Card v1.1.0 (Release Candidate)
+ * MarvGallery Card v1.1.1
  * Created by MrMarv89
  * * Description:
  * A high-performance media gallery for Home Assistant.
- * Optimized for mobile devices with smart thumbnail generation and corrupt file filtering.
- * * Changelog v1.1.0:
- * - PERFORMANCE FIX: Auto-refresh is now paused while thumbnails are generating to prevent UI freeze on mobile.
- * - PERFORMANCE FIX: Preserves thumbnail state across refreshes to avoid re-scanning known files.
- * - NEW: Increased video validation timeout for slower mobile connections.
+ * * Changelog v1.1.1:
+ * - CRITICAL FIX iOS: Changed timeout logic. If a check times out, the file is now KEPT instead of hidden.
+ * (Prevents hiding valid files on slow connections/iPhones).
+ * - TWEAK: Reduced thumbnail batch size to 1 to reduce load on mobile network stack.
+ * - FIX: Strict separate handling of error (hide) vs timeout (show).
  */
 
 import { LitElement, html, css } from "https://unpkg.com/lit-element@2.5.1/lit-element.js?module";
@@ -288,12 +288,9 @@ class MarvGalleryCard extends LitElement {
     if (interval > 0) {
       this._refreshTimer = setInterval(() => {
         // PERFORMANCE FIX: 
-        // Do NOT refresh if thumbnails are currently being generated or video is playing.
-        // This prevents the mobile device from being overwhelmed.
         if (this._activeChecks.size > 0 || this._playingItem) {
             return;
         }
-
         if (this._history.length === 0) {
            this._loadMedia(null, true, true);
         }
@@ -373,9 +370,7 @@ class MarvGalleryCard extends LitElement {
         if(!this.config.title) title = result.title;
       }
 
-      // STATE MERGE LOGIC:
-      // If we are refreshing, we want to keep the "checked" and "resolved_url" status
-      // of files we already know, to avoid re-checking them (Performance).
+      // STATE MERGE: Preserve checked status
       if (forceRefresh && this._mediaEvents && this._mediaEvents.children) {
           const oldMap = new Map(this._mediaEvents.children.map(i => [i.media_content_id, i]));
           children = children.map(newChild => {
@@ -443,7 +438,6 @@ class MarvGalleryCard extends LitElement {
         const date = this._parseDate(item.title);
         let displayTitle = item.title;
         if (date) { displayTitle = this._formatDate(date); }
-        // Ensure properties are synced if reference changed
         const originalItem = this._mediaEvents.children.find(c => c.media_content_id === item.media_content_id);
         if(originalItem) {
             return { ...item, displayTitle, resolved_url: originalItem.resolved_url, is_broken: originalItem.is_broken, checked: originalItem.checked };
@@ -472,7 +466,8 @@ class MarvGalleryCard extends LitElement {
                   } else { resolve(false); }
               } catch(e) { resolve(false); } 
           };
-          img.onerror = () => { resolve(false); };
+          // For images: If it errors, it's likely broken.
+          img.onerror = () => { resolve(true); };
           img.src = url;
       });
   }
@@ -482,7 +477,7 @@ class MarvGalleryCard extends LitElement {
           const video = document.createElement('video');
           video.muted = true;
           video.playsInline = true; 
-          video.preload = 'metadata'; // Optimized preload
+          video.preload = 'metadata'; 
           video.crossOrigin = "Anonymous"; 
 
           const checkFrame = () => {
@@ -492,31 +487,36 @@ class MarvGalleryCard extends LitElement {
                   const ctx = canvas.getContext('2d');
                   ctx.drawImage(video, 0, 0, 1, 1);
                   const p = ctx.getImageData(0, 0, 1, 1).data;
-                  if (p[3] === 0) return true; 
+                  if (p[3] === 0) return true; // Empty/Alpha
                   if (threshold > 0) {
                       const brightness = (p[0] + p[1] + p[2]) / 3;
-                      if (brightness < threshold) return true; 
+                      if (brightness < threshold) return true; // Too dark
                   }
-                  return false; 
-              } catch(e) { return false; }
+                  return false; // Valid
+              } catch(e) { return false; } // Error reading canvas? Keep file.
           };
 
-          // Increased timeout to 10s for Mobile
+          // CRITICAL FIX: Timeout now resolves FALSE (Good/Keep file).
+          // If the phone is too slow to load the video, we assume it's valid
+          // rather than hiding a good recording.
           const timer = setTimeout(() => {
               video.src = ""; 
-              resolve(true); // Treat as broken if timeout
-          }, 10000);
+              resolve(false); 
+          }, 15000); // 15s timeout
 
           video.onseeked = () => {
               clearTimeout(timer);
               const isBad = checkFrame();
               resolve(isBad);
           };
+          
+          // Only true errors (404, format) cause hiding.
           video.onerror = () => { clearTimeout(timer); resolve(true); };
+          
           video.onloadedmetadata = () => {
              let target = 0.5;
              if (video.duration < 1.0 && video.duration > 0) target = video.duration / 2;
-             video.currentTime = target; // Triggers seeked
+             video.currentTime = target; 
           };
           video.src = url;
       });
@@ -528,15 +528,13 @@ class MarvGalleryCard extends LitElement {
     const visible = this._getVisibleItems();
     const threshold = this.config.filter_darkness_threshold !== undefined ? parseInt(this.config.filter_darkness_threshold) : 10;
     
-    // Filter items that need checking
     const toCheck = visible.filter(item => {
         if (item.can_expand) return false;
-        if (this._activeChecks.has(item.media_content_id)) return false; // Already checking
+        if (this._activeChecks.has(item.media_content_id)) return false;
 
         const sourceItem = this._mediaEvents.children.find(c => c.media_content_id === item.media_content_id);
-        if (!sourceItem || sourceItem.checked) return false; // Already done
+        if (!sourceItem || sourceItem.checked) return false;
         
-        // Check localStorage cache first
         const cachedUrl = this._getFromStorage(item.media_content_id);
         if (cachedUrl && !this.config.filter_broken) {
              sourceItem.resolved_url = cachedUrl;
@@ -549,10 +547,9 @@ class MarvGalleryCard extends LitElement {
 
     if (toCheck.length === 0) return;
 
-    // Small batch size for mobile stability
-    const BATCH_SIZE = 2;
+    // MOBILE FIX: Batch Size 1 is safest for iPhone
+    const BATCH_SIZE = 1;
     for (let i = 0; i < toCheck.length; i += BATCH_SIZE) {
-        // Stop if user navigated away
         if (!this.isConnected) return;
 
         const batch = toCheck.slice(i, i + BATCH_SIZE);
@@ -584,14 +581,14 @@ class MarvGalleryCard extends LitElement {
                 }
                 sourceItem.checked = true;
             } catch(e) { 
-                sourceItem.is_broken = true;
+                // Resolve error (WS fail) -> Keep it but don't cache
+                // sourceItem.is_broken = true; // Don't hide unless sure
                 sourceItem.checked = true;
             } finally {
                 this._activeChecks.delete(item.media_content_id);
             }
         }));
         
-        // Update UI after batch
         this.requestUpdate();
     }
   }
