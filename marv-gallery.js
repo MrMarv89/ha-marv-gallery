@@ -1,13 +1,13 @@
 /**
- * MarvGallery Card v1.1.2
+ * MarvGallery Card v1.1.3
  * Created by MrMarv89
  * * Description:
  * A high-performance media gallery for Home Assistant.
- * * Changelog v1.1.2:
- * - NEW: Serial Processing Queue. Items are processed strictly one-by-one to save mobile CPU/RAM.
- * - FIX: Auto-Refresh is completely BLOCKED while queue is active to prevent crashes/stutter.
- * - FIX: "Black Gap" bug fixed. When an item is hidden, the next item is immediately queued for checking.
- * - FIX: Fail-Safe Validity Check. If metadata loads slowly (>5s), file is assumed valid (keeps file safe).
+ * * Changelog v1.1.3:
+ * - FIX: Interaction Lock. Auto-Refresh is paused for 30 seconds after user interaction (Load More, Click, etc.)
+ * to prevent UI overlap/glitches while browsing.
+ * - FIX: "Load More" now smoothly integrates with the queue system.
+ * - PREVIOUS: Includes all mobile performance fixes (Queue, Refresh-Blocker, Timeout-Safety).
  */
 
 import { LitElement, html, css } from "https://unpkg.com/lit-element@2.5.1/lit-element.js?module";
@@ -221,9 +221,11 @@ class MarvGalleryCard extends LitElement {
     this._refreshTimer = null;
     this._hiddenCount = 0;
     
-    // QUEUE SYSTEM
     this._processingQueue = false;
     this._queueList = [];
+    
+    // V1.1.3: User Interaction Timestamp
+    this._lastInteraction = 0;
   }
 
   setConfig(config) {
@@ -285,10 +287,15 @@ class MarvGalleryCard extends LitElement {
     const interval = parseInt(this.config.auto_refresh_interval);
     if (interval > 0) {
       this._refreshTimer = setInterval(() => {
-        // CRITICAL FIX v1.1.2:
-        // Do NOT refresh if ANY processing is happening.
+        // V1.1.3 FIX: User Interaction check
+        // If user interacted in last 30 seconds, pause refresh.
+        if (Date.now() - this._lastInteraction < 30000) {
+            // console.log("Skipping refresh due to user interaction");
+            return;
+        }
+
+        // V1.1.2 FIX: Queue check
         if (this._processingQueue || this._queueList.length > 0 || this._playingItem) {
-            console.log("MarvGallery: Auto-Refresh skipped (System Busy)");
             return;
         }
 
@@ -312,8 +319,6 @@ class MarvGalleryCard extends LitElement {
       this._loadMedia();
     }
     
-    // Trigger queue if limit changes, events change, sort changes
-    // OR if UI has updated (might reveal new items that need checking)
     if (changedProps.has('_currentLimit') || changedProps.has('_mediaEvents') || changedProps.has('_currentSort') || changedProps.has('_loading')) {
         this._planQueueCheck();
     }
@@ -419,7 +424,6 @@ class MarvGalleryCard extends LitElement {
   _getVisibleItems() {
     if (!this._mediaEvents || !this._mediaEvents.children) return [];
     let processed = [...this._mediaEvents.children];
-    const originalCount = processed.length;
     
     if (this.config.recursive) processed = processed.filter(f => !f.can_expand);
     
@@ -427,7 +431,7 @@ class MarvGalleryCard extends LitElement {
         processed = processed.filter(item => item.is_broken !== true);
     }
 
-    this._hiddenCount = originalCount - processed.length;
+    this._hiddenCount = this._mediaEvents.children.length - processed.length;
 
     if (this.config.parsed_date_sort) {
       processed.sort((a, b) => {
@@ -500,25 +504,19 @@ class MarvGalleryCard extends LitElement {
               } catch(e) { return false; }
           };
 
-          // TIMEOUT HANDLING V1.1.2:
-          // Short timeout for METADATA loading (5s). If that fails, assume file is Valid but slow.
           const metaTimer = setTimeout(() => {
               video.src = "";
-              // console.log("Metadata timeout - assuming valid");
               resolve(false); 
           }, 5000);
 
           video.onloadedmetadata = () => {
              clearTimeout(metaTimer);
              if (video.duration === 0) {
-                 resolve(true); // Duration 0 is definitely broken
+                 resolve(true); 
              } else {
-                 // Try to seek to check pixels
                  let target = 0.5;
                  if (video.duration < 1.0) target = video.duration / 2;
                  video.currentTime = target;
-                 
-                 // Second Timeout: Seeking. If seeking takes too long, keep file.
                  setTimeout(() => resolve(false), 5000);
              }
           };
@@ -533,20 +531,18 @@ class MarvGalleryCard extends LitElement {
       });
   }
 
-  // --- NEW QUEUE SYSTEM ---
+  // --- QUEUE SYSTEM ---
   _planQueueCheck() {
       if (!this.config.enablePreview) return;
-      if (this._processingQueue) return; // Already running
+      if (this._processingQueue) return;
 
       const visible = this._getVisibleItems();
       
-      // Identify unchecked items
       this._queueList = visible.filter(item => {
         if (item.can_expand) return false;
         const sourceItem = this._mediaEvents.children.find(c => c.media_content_id === item.media_content_id);
         if (!sourceItem || sourceItem.checked) return false;
         
-        // Cache Check
         const cachedUrl = this._getFromStorage(item.media_content_id);
         if (cachedUrl && !this.config.filter_broken) {
              sourceItem.resolved_url = cachedUrl;
@@ -568,7 +564,7 @@ class MarvGalleryCard extends LitElement {
       }
       
       this._processingQueue = true;
-      const item = this._queueList.shift(); // Take 1 item
+      const item = this._queueList.shift(); 
       const threshold = this.config.filter_darkness_threshold !== undefined ? parseInt(this.config.filter_darkness_threshold) : 10;
 
       const sourceItem = this._mediaEvents.children.find(c => c.media_content_id === item.media_content_id);
@@ -588,12 +584,10 @@ class MarvGalleryCard extends LitElement {
 
                   if (isBad) {
                       sourceItem.is_broken = true;
-                      // Trigger update immediately to hide this and potentially queue next item
                       this.requestUpdate().then(() => {
-                           // Allow UI to render, then continue queue
                            setTimeout(() => {
                                this._processingQueue = false;
-                               this._planQueueCheck(); // Re-evaluate visible items!
+                               this._planQueueCheck(); 
                            }, 50);
                       });
                       return; 
@@ -605,14 +599,11 @@ class MarvGalleryCard extends LitElement {
               }
               sourceItem.checked = true;
           } catch(e) { 
-              sourceItem.checked = true; // Mark checked even on error to avoid loop
+              sourceItem.checked = true; 
           }
       }
 
-      // Render update
       this.requestUpdate();
-      
-      // Continue next item with small delay to let UI breathe
       setTimeout(() => {
           this._processingQueue = false;
           this._planQueueCheck();
@@ -642,6 +633,7 @@ class MarvGalleryCard extends LitElement {
   }
 
   _handleItemClick(item) {
+    this._lastInteraction = Date.now(); // Interaction!
     if (item.can_expand) {
       this._history.push(this._mediaEvents);
       this._currentLimit = parseInt(this.config.maximum_files);
@@ -665,9 +657,13 @@ class MarvGalleryCard extends LitElement {
     }
   }
 
-  _toggleMenu() { this._menuOpen = !this._menuOpen; }
+  _toggleMenu() { 
+      this._lastInteraction = Date.now(); // Interaction!
+      this._menuOpen = !this._menuOpen; 
+  }
   
   _menuAction(action) {
+    this._lastInteraction = Date.now(); // Interaction!
     this._menuOpen = false;
     if (action === 'refresh') { 
         MarvGalleryCard._internalCache.clear(); 
@@ -679,6 +675,7 @@ class MarvGalleryCard extends LitElement {
   }
 
   _increaseLimit() {
+      this._lastInteraction = Date.now(); // Interaction!
       const step = parseInt(this.config.load_more_count) || 10;
       this._currentLimit += step;
   }
@@ -690,8 +687,8 @@ class MarvGalleryCard extends LitElement {
     if (!document.fullscreenElement) { el.requestFullscreen().catch(err => console.log(err)); } else { document.exitFullscreen(); }
   }
 
-  _playNext() { this._navigatePlayer(1); }
-  _playPrev() { this._navigatePlayer(-1); }
+  _playNext() { this._lastInteraction = Date.now(); this._navigatePlayer(1); }
+  _playPrev() { this._lastInteraction = Date.now(); this._navigatePlayer(-1); }
 
   _navigatePlayer(direction) {
     const visible = this._getVisibleItems(); 
@@ -708,6 +705,7 @@ class MarvGalleryCard extends LitElement {
   }
 
   _handleBack() {
+    this._lastInteraction = Date.now();
     if (this._history.length > 0) { const prev = this._history.pop(); this._mediaEvents = prev; this._currentLimit = parseInt(this.config.maximum_files); this.requestUpdate(); } else { this._loadMedia(); }
   }
 
