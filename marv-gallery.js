@@ -1,11 +1,13 @@
 /**
- * MarvGallery Card v1.0.0
+ * MarvGallery Card v1.1.0 (Release Candidate)
  * Created by MrMarv89
- * * Features:
- * - Smart filtering for corrupt/empty video files (Zombie Files).
- * - Configurable darkness threshold to hide black recordings.
- * - Optimized parallel thumbnail loading queue.
- * - Multi-language support (EN/DE).
+ * * Description:
+ * A high-performance media gallery for Home Assistant.
+ * Optimized for mobile devices with smart thumbnail generation and corrupt file filtering.
+ * * Changelog v1.1.0:
+ * - PERFORMANCE FIX: Auto-refresh is now paused while thumbnails are generating to prevent UI freeze on mobile.
+ * - PERFORMANCE FIX: Preserves thumbnail state across refreshes to avoid re-scanning known files.
+ * - NEW: Increased video validation timeout for slower mobile connections.
  */
 
 import { LitElement, html, css } from "https://unpkg.com/lit-element@2.5.1/lit-element.js?module";
@@ -285,7 +287,14 @@ class MarvGalleryCard extends LitElement {
     const interval = parseInt(this.config.auto_refresh_interval);
     if (interval > 0) {
       this._refreshTimer = setInterval(() => {
-        if (this._history.length === 0 && !this._playingItem) {
+        // PERFORMANCE FIX: 
+        // Do NOT refresh if thumbnails are currently being generated or video is playing.
+        // This prevents the mobile device from being overwhelmed.
+        if (this._activeChecks.size > 0 || this._playingItem) {
+            return;
+        }
+
+        if (this._history.length === 0) {
            this._loadMedia(null, true, true);
         }
       }, interval * 1000);
@@ -363,6 +372,26 @@ class MarvGalleryCard extends LitElement {
         children = result.children || [];
         if(!this.config.title) title = result.title;
       }
+
+      // STATE MERGE LOGIC:
+      // If we are refreshing, we want to keep the "checked" and "resolved_url" status
+      // of files we already know, to avoid re-checking them (Performance).
+      if (forceRefresh && this._mediaEvents && this._mediaEvents.children) {
+          const oldMap = new Map(this._mediaEvents.children.map(i => [i.media_content_id, i]));
+          children = children.map(newChild => {
+              const oldChild = oldMap.get(newChild.media_content_id);
+              if (oldChild && oldChild.checked) {
+                  return { 
+                      ...newChild, 
+                      checked: true, 
+                      is_broken: oldChild.is_broken, 
+                      resolved_url: oldChild.resolved_url 
+                  };
+              }
+              return newChild;
+          });
+      }
+
       this._mediaEvents = { title, children, media_content_id: path };
       this._loading = false;
       if (!contentId) MarvGalleryCard._internalCache.set(path, this._mediaEvents);
@@ -414,6 +443,7 @@ class MarvGalleryCard extends LitElement {
         const date = this._parseDate(item.title);
         let displayTitle = item.title;
         if (date) { displayTitle = this._formatDate(date); }
+        // Ensure properties are synced if reference changed
         const originalItem = this._mediaEvents.children.find(c => c.media_content_id === item.media_content_id);
         if(originalItem) {
             return { ...item, displayTitle, resolved_url: originalItem.resolved_url, is_broken: originalItem.is_broken, checked: originalItem.checked };
@@ -452,7 +482,7 @@ class MarvGalleryCard extends LitElement {
           const video = document.createElement('video');
           video.muted = true;
           video.playsInline = true; 
-          video.preload = 'auto'; 
+          video.preload = 'metadata'; // Optimized preload
           video.crossOrigin = "Anonymous"; 
 
           const checkFrame = () => {
@@ -471,10 +501,11 @@ class MarvGalleryCard extends LitElement {
               } catch(e) { return false; }
           };
 
+          // Increased timeout to 10s for Mobile
           const timer = setTimeout(() => {
               video.src = ""; 
-              resolve(true); 
-          }, 3000);
+              resolve(true); // Treat as broken if timeout
+          }, 10000);
 
           video.onseeked = () => {
               clearTimeout(timer);
@@ -485,7 +516,7 @@ class MarvGalleryCard extends LitElement {
           video.onloadedmetadata = () => {
              let target = 0.5;
              if (video.duration < 1.0 && video.duration > 0) target = video.duration / 2;
-             video.currentTime = target;
+             video.currentTime = target; // Triggers seeked
           };
           video.src = url;
       });
@@ -497,13 +528,15 @@ class MarvGalleryCard extends LitElement {
     const visible = this._getVisibleItems();
     const threshold = this.config.filter_darkness_threshold !== undefined ? parseInt(this.config.filter_darkness_threshold) : 10;
     
+    // Filter items that need checking
     const toCheck = visible.filter(item => {
         if (item.can_expand) return false;
-        if (this._activeChecks.has(item.media_content_id)) return false;
+        if (this._activeChecks.has(item.media_content_id)) return false; // Already checking
 
         const sourceItem = this._mediaEvents.children.find(c => c.media_content_id === item.media_content_id);
-        if (!sourceItem || sourceItem.checked) return false;
+        if (!sourceItem || sourceItem.checked) return false; // Already done
         
+        // Check localStorage cache first
         const cachedUrl = this._getFromStorage(item.media_content_id);
         if (cachedUrl && !this.config.filter_broken) {
              sourceItem.resolved_url = cachedUrl;
@@ -516,8 +549,12 @@ class MarvGalleryCard extends LitElement {
 
     if (toCheck.length === 0) return;
 
+    // Small batch size for mobile stability
     const BATCH_SIZE = 2;
     for (let i = 0; i < toCheck.length; i += BATCH_SIZE) {
+        // Stop if user navigated away
+        if (!this.isConnected) return;
+
         const batch = toCheck.slice(i, i + BATCH_SIZE);
         batch.forEach(b => this._activeChecks.add(b.media_content_id));
 
@@ -539,7 +576,6 @@ class MarvGalleryCard extends LitElement {
 
                     if (isBad) {
                         sourceItem.is_broken = true;
-                        this._mediaEvents = { ...this._mediaEvents };
                     } else {
                         this._saveToStorage(item.media_content_id, source.url);
                     }
@@ -550,12 +586,12 @@ class MarvGalleryCard extends LitElement {
             } catch(e) { 
                 sourceItem.is_broken = true;
                 sourceItem.checked = true;
-                this._mediaEvents = { ...this._mediaEvents };
             } finally {
                 this._activeChecks.delete(item.media_content_id);
             }
         }));
         
+        // Update UI after batch
         this.requestUpdate();
     }
   }
@@ -711,7 +747,7 @@ class MarvGalleryCard extends LitElement {
                     ? html`<div class="media-icon-placeholder"><ha-icon icon="mdi:folder" style="--mdc-icon-size: 36px;"></ha-icon></div>`
                     : item.resolved_url 
                     ? (item.media_class === 'video' 
-                       ? html`<video class="media-preview-video" src="${item.resolved_url}#t=0.1" preload="auto" crossorigin="anonymous" playsinline muted></video>` 
+                       ? html`<video class="media-preview-video" src="${item.resolved_url}#t=0.1" preload="metadata" crossorigin="anonymous" playsinline muted></video>` 
                        : html`<img class="media-preview-img" src="${item.resolved_url}" loading="lazy">`)
                     : html`<div class="media-icon-placeholder"><ha-icon icon="${item.media_class==='video'?'mdi:video':'mdi:file'}" style="--mdc-icon-size: 28px;"></ha-icon></div>`
                 }
