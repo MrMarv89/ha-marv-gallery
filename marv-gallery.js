@@ -1,13 +1,13 @@
 /**
- * MarvGallery Card v1.1.1
+ * MarvGallery Card v1.1.2
  * Created by MrMarv89
  * * Description:
  * A high-performance media gallery for Home Assistant.
- * * Changelog v1.1.1:
- * - CRITICAL FIX iOS: Changed timeout logic. If a check times out, the file is now KEPT instead of hidden.
- * (Prevents hiding valid files on slow connections/iPhones).
- * - TWEAK: Reduced thumbnail batch size to 1 to reduce load on mobile network stack.
- * - FIX: Strict separate handling of error (hide) vs timeout (show).
+ * * Changelog v1.1.2:
+ * - NEW: Serial Processing Queue. Items are processed strictly one-by-one to save mobile CPU/RAM.
+ * - FIX: Auto-Refresh is completely BLOCKED while queue is active to prevent crashes/stutter.
+ * - FIX: "Black Gap" bug fixed. When an item is hidden, the next item is immediately queued for checking.
+ * - FIX: Fail-Safe Validity Check. If metadata loads slowly (>5s), file is assumed valid (keeps file safe).
  */
 
 import { LitElement, html, css } from "https://unpkg.com/lit-element@2.5.1/lit-element.js?module";
@@ -146,7 +146,6 @@ class MarvGalleryCard extends LitElement {
         overflow: hidden; border-radius: var(--ha-card-border-radius, 12px); position: relative;
       }
       
-      /* HEADER */
       .header {
         display: flex; align-items: center; justify-content: space-between;
         padding: 10px 16px; background: var(--primary-background-color, #fafafa);
@@ -165,7 +164,6 @@ class MarvGalleryCard extends LitElement {
       .icon-btn { cursor: pointer; --mdc-icon-size: 24px; color: var(--primary-text-color); padding: 8px; }
       .icon-btn:hover { background-color: rgba(0,0,0,0.05); border-radius: 50%; }
       
-      /* MENU */
       .menu-popup {
         position: absolute; right: 8px; background: var(--card-background-color, white);
         border: 1px solid var(--divider-color, #eee); box-shadow: 0 4px 10px rgba(0,0,0,0.3);
@@ -177,7 +175,6 @@ class MarvGalleryCard extends LitElement {
       .menu-item:hover { background: rgba(0,0,0,0.05); }
       .menu-overlay { position: absolute; inset: 0; z-index: 99; background: transparent; }
 
-      /* PLAYER */
       .player-container { flex: 1; display: flex; flex-direction: column; background: #000; overflow: hidden; height: 100%; }
       .player-menu { background: rgba(255, 255, 255, 0.1); padding: 8px 12px; display: flex; flex-direction: column; gap: 4px; border-bottom: 1px solid #333; flex-shrink: 0; }
       .player-controls { display: flex; gap: 20px; align-items: center; justify-content: center; }
@@ -186,7 +183,6 @@ class MarvGalleryCard extends LitElement {
       .player-content video, .player-content img { max-width: 100%; max-height: 100%; width: auto; height: auto; }
       .player-menu .icon-btn { color: white; }
 
-      /* GRID */
       .scroll-wrapper { flex: 1; overflow-y: auto; display: flex; flex-direction: column; padding: 8px; }
       .content-grid { display: grid; grid-template-columns: var(--mec-grid-cols); gap: 8px; }
       
@@ -205,7 +201,6 @@ class MarvGalleryCard extends LitElement {
       .media-info { position: absolute; bottom: 0; left: 0; right: 0; background: rgba(0,0,0,0.75); color: white; font-size: 10px; padding: 2px 4px; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       .folder-badge { position: absolute; top: 4px; right: 4px; background: var(--primary-color, #03a9f4); color: white; border-radius: 4px; padding: 2px 6px; font-size: 10px; font-weight: bold; z-index: 2; }
 
-      /* FOOTER */
       .footer-actions { padding: 16px 0; display: flex; flex-direction: column; align-items: center; gap: 8px; justify-content: center; width: 100%; position: relative; }
       .load-more-btn { background: var(--mec-btn-bg, var(--primary-color)); color: var(--mec-btn-color, white); border: none; padding: 8px 20px; border-radius: 20px; cursor: pointer; font-weight: 500; font-size: 14px; box-shadow: 0 2px 5px rgba(0,0,0,0.2); display: flex; align-items: center; gap: 8px; transition: opacity 0.2s; }
       .load-more-btn:active { opacity: 0.8; }
@@ -225,7 +220,10 @@ class MarvGalleryCard extends LitElement {
     this._currentSort = 'desc';
     this._refreshTimer = null;
     this._hiddenCount = 0;
-    this._activeChecks = new Set();
+    
+    // QUEUE SYSTEM
+    this._processingQueue = false;
+    this._queueList = [];
   }
 
   setConfig(config) {
@@ -287,10 +285,13 @@ class MarvGalleryCard extends LitElement {
     const interval = parseInt(this.config.auto_refresh_interval);
     if (interval > 0) {
       this._refreshTimer = setInterval(() => {
-        // PERFORMANCE FIX: 
-        if (this._activeChecks.size > 0 || this._playingItem) {
+        // CRITICAL FIX v1.1.2:
+        // Do NOT refresh if ANY processing is happening.
+        if (this._processingQueue || this._queueList.length > 0 || this._playingItem) {
+            console.log("MarvGallery: Auto-Refresh skipped (System Busy)");
             return;
         }
+
         if (this._history.length === 0) {
            this._loadMedia(null, true, true);
         }
@@ -310,8 +311,11 @@ class MarvGalleryCard extends LitElement {
       this._initLoaded = true;
       this._loadMedia();
     }
-    if (changedProps.has('_currentLimit') || changedProps.has('_mediaEvents') || changedProps.has('_currentSort')) {
-        this._triggerThumbnailFetch();
+    
+    // Trigger queue if limit changes, events change, sort changes
+    // OR if UI has updated (might reveal new items that need checking)
+    if (changedProps.has('_currentLimit') || changedProps.has('_mediaEvents') || changedProps.has('_currentSort') || changedProps.has('_loading')) {
+        this._planQueueCheck();
     }
   }
 
@@ -370,7 +374,7 @@ class MarvGalleryCard extends LitElement {
         if(!this.config.title) title = result.title;
       }
 
-      // STATE MERGE: Preserve checked status
+      // STATE MERGE
       if (forceRefresh && this._mediaEvents && this._mediaEvents.children) {
           const oldMap = new Map(this._mediaEvents.children.map(i => [i.media_content_id, i]));
           children = children.map(newChild => {
@@ -438,6 +442,7 @@ class MarvGalleryCard extends LitElement {
         const date = this._parseDate(item.title);
         let displayTitle = item.title;
         if (date) { displayTitle = this._formatDate(date); }
+        
         const originalItem = this._mediaEvents.children.find(c => c.media_content_id === item.media_content_id);
         if(originalItem) {
             return { ...item, displayTitle, resolved_url: originalItem.resolved_url, is_broken: originalItem.is_broken, checked: originalItem.checked };
@@ -466,7 +471,6 @@ class MarvGalleryCard extends LitElement {
                   } else { resolve(false); }
               } catch(e) { resolve(false); } 
           };
-          // For images: If it errors, it's likely broken.
           img.onerror = () => { resolve(true); };
           img.src = url;
       });
@@ -487,110 +491,132 @@ class MarvGalleryCard extends LitElement {
                   const ctx = canvas.getContext('2d');
                   ctx.drawImage(video, 0, 0, 1, 1);
                   const p = ctx.getImageData(0, 0, 1, 1).data;
-                  if (p[3] === 0) return true; // Empty/Alpha
+                  if (p[3] === 0) return true; 
                   if (threshold > 0) {
                       const brightness = (p[0] + p[1] + p[2]) / 3;
-                      if (brightness < threshold) return true; // Too dark
+                      if (brightness < threshold) return true; 
                   }
-                  return false; // Valid
-              } catch(e) { return false; } // Error reading canvas? Keep file.
+                  return false; 
+              } catch(e) { return false; }
           };
 
-          // CRITICAL FIX: Timeout now resolves FALSE (Good/Keep file).
-          // If the phone is too slow to load the video, we assume it's valid
-          // rather than hiding a good recording.
-          const timer = setTimeout(() => {
-              video.src = ""; 
+          // TIMEOUT HANDLING V1.1.2:
+          // Short timeout for METADATA loading (5s). If that fails, assume file is Valid but slow.
+          const metaTimer = setTimeout(() => {
+              video.src = "";
+              // console.log("Metadata timeout - assuming valid");
               resolve(false); 
-          }, 15000); // 15s timeout
+          }, 5000);
+
+          video.onloadedmetadata = () => {
+             clearTimeout(metaTimer);
+             if (video.duration === 0) {
+                 resolve(true); // Duration 0 is definitely broken
+             } else {
+                 // Try to seek to check pixels
+                 let target = 0.5;
+                 if (video.duration < 1.0) target = video.duration / 2;
+                 video.currentTime = target;
+                 
+                 // Second Timeout: Seeking. If seeking takes too long, keep file.
+                 setTimeout(() => resolve(false), 5000);
+             }
+          };
 
           video.onseeked = () => {
-              clearTimeout(timer);
               const isBad = checkFrame();
               resolve(isBad);
           };
           
-          // Only true errors (404, format) cause hiding.
-          video.onerror = () => { clearTimeout(timer); resolve(true); };
-          
-          video.onloadedmetadata = () => {
-             let target = 0.5;
-             if (video.duration < 1.0 && video.duration > 0) target = video.duration / 2;
-             video.currentTime = target; 
-          };
+          video.onerror = () => { clearTimeout(metaTimer); resolve(true); };
           video.src = url;
       });
   }
 
-  async _triggerThumbnailFetch() {
-    if (!this.config.enablePreview) return;
-    
-    const visible = this._getVisibleItems();
-    const threshold = this.config.filter_darkness_threshold !== undefined ? parseInt(this.config.filter_darkness_threshold) : 10;
-    
-    const toCheck = visible.filter(item => {
-        if (item.can_expand) return false;
-        if (this._activeChecks.has(item.media_content_id)) return false;
+  // --- NEW QUEUE SYSTEM ---
+  _planQueueCheck() {
+      if (!this.config.enablePreview) return;
+      if (this._processingQueue) return; // Already running
 
+      const visible = this._getVisibleItems();
+      
+      // Identify unchecked items
+      this._queueList = visible.filter(item => {
+        if (item.can_expand) return false;
         const sourceItem = this._mediaEvents.children.find(c => c.media_content_id === item.media_content_id);
         if (!sourceItem || sourceItem.checked) return false;
         
+        // Cache Check
         const cachedUrl = this._getFromStorage(item.media_content_id);
         if (cachedUrl && !this.config.filter_broken) {
              sourceItem.resolved_url = cachedUrl;
              sourceItem.checked = true;
-             this.requestUpdate();
              return false;
         }
         return true;
-    });
+      });
 
-    if (toCheck.length === 0) return;
+      if (this._queueList.length > 0) {
+          this._processQueue();
+      }
+  }
 
-    // MOBILE FIX: Batch Size 1 is safest for iPhone
-    const BATCH_SIZE = 1;
-    for (let i = 0; i < toCheck.length; i += BATCH_SIZE) {
-        if (!this.isConnected) return;
+  async _processQueue() {
+      if (this._processingQueue || this._queueList.length === 0) {
+          this._processingQueue = false;
+          return;
+      }
+      
+      this._processingQueue = true;
+      const item = this._queueList.shift(); // Take 1 item
+      const threshold = this.config.filter_darkness_threshold !== undefined ? parseInt(this.config.filter_darkness_threshold) : 10;
 
-        const batch = toCheck.slice(i, i + BATCH_SIZE);
-        batch.forEach(b => this._activeChecks.add(b.media_content_id));
+      const sourceItem = this._mediaEvents.children.find(c => c.media_content_id === item.media_content_id);
+      
+      if (sourceItem) {
+          try {
+              const source = await this.hass.callWS({ type: "media_source/resolve_media", media_content_id: item.media_content_id });
+              sourceItem.resolved_url = source.url;
+              
+              if (this.config.filter_broken) {
+                  let isBad = false;
+                  if (item.media_class === 'video') {
+                      isBad = await this._checkVideoValidity(source.url, threshold);
+                  } else {
+                      isBad = await this._checkImageDarkness(source.url, threshold);
+                  }
 
-        await Promise.all(batch.map(async (item) => {
-            const sourceItem = this._mediaEvents.children.find(c => c.media_content_id === item.media_content_id);
-            if (!sourceItem) return;
+                  if (isBad) {
+                      sourceItem.is_broken = true;
+                      // Trigger update immediately to hide this and potentially queue next item
+                      this.requestUpdate().then(() => {
+                           // Allow UI to render, then continue queue
+                           setTimeout(() => {
+                               this._processingQueue = false;
+                               this._planQueueCheck(); // Re-evaluate visible items!
+                           }, 50);
+                      });
+                      return; 
+                  } else {
+                      this._saveToStorage(item.media_content_id, source.url);
+                  }
+              } else {
+                  this._saveToStorage(item.media_content_id, source.url);
+              }
+              sourceItem.checked = true;
+          } catch(e) { 
+              sourceItem.checked = true; // Mark checked even on error to avoid loop
+          }
+      }
 
-            try {
-                const source = await this.hass.callWS({ type: "media_source/resolve_media", media_content_id: item.media_content_id });
-                sourceItem.resolved_url = source.url;
-                
-                if (this.config.filter_broken) {
-                    let isBad = false;
-                    if (item.media_class === 'video') {
-                        isBad = await this._checkVideoValidity(source.url, threshold);
-                    } else {
-                        isBad = await this._checkImageDarkness(source.url, threshold);
-                    }
-
-                    if (isBad) {
-                        sourceItem.is_broken = true;
-                    } else {
-                        this._saveToStorage(item.media_content_id, source.url);
-                    }
-                } else {
-                    this._saveToStorage(item.media_content_id, source.url);
-                }
-                sourceItem.checked = true;
-            } catch(e) { 
-                // Resolve error (WS fail) -> Keep it but don't cache
-                // sourceItem.is_broken = true; // Don't hide unless sure
-                sourceItem.checked = true;
-            } finally {
-                this._activeChecks.delete(item.media_content_id);
-            }
-        }));
-        
-        this.requestUpdate();
-    }
+      // Render update
+      this.requestUpdate();
+      
+      // Continue next item with small delay to let UI breathe
+      setTimeout(() => {
+          this._processingQueue = false;
+          this._planQueueCheck();
+      }, 50);
   }
 
   _parseDate(filename) {
