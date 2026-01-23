@@ -1,10 +1,13 @@
 /**
- * MarvGallery Card v1.2.0
+ * MarvGallery Card v1.2.1
  * Created by MrMarv89
  * Refactored & Fixed by Claude
  * 
  * Description:
  * A high-performance media gallery for Home Assistant.
+ * 
+ * Changelog v1.2.1:
+ * - FIX: Broken status (isBroken) is now cached in IndexedDB - no re-checking on reload!
  * 
  * Changelog v1.2.0:
  * - FIX: Memory Leak - Proper cleanup of Blob URLs via revokeObjectURL
@@ -25,7 +28,7 @@ import { repeat } from "https://unpkg.com/lit-html@1.4.1/directives/repeat.js?mo
 class MarvDB {
   static DB_NAME = "MarvGalleryDB";
   static STORE_NAME = "thumbnails";
-  static VERSION = 2;
+  static VERSION = 3; // Bumped for new schema with isBroken field
   static MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
   static _dbInstance = null;
@@ -40,10 +43,12 @@ class MarvDB {
       
       req.onupgradeneeded = (e) => {
         const db = e.target.result;
-        if (!db.objectStoreNames.contains(MarvDB.STORE_NAME)) {
-          const store = db.createObjectStore(MarvDB.STORE_NAME, { keyPath: "id" });
-          store.createIndex("created", "created", { unique: false });
+        // Delete old store to rebuild with new schema
+        if (db.objectStoreNames.contains(MarvDB.STORE_NAME)) {
+          db.deleteObjectStore(MarvDB.STORE_NAME);
         }
+        const store = db.createObjectStore(MarvDB.STORE_NAME, { keyPath: "id" });
+        store.createIndex("created", "created", { unique: false });
       };
       
       req.onsuccess = () => {
@@ -64,6 +69,9 @@ class MarvDB {
     });
   }
 
+  /**
+   * Get cached entry - now returns { blob, isBroken } or null
+   */
   static async get(id) {
     try {
       const db = await MarvDB.open();
@@ -79,7 +87,11 @@ class MarvDB {
               MarvDB.delete(id); // Async cleanup
               resolve(null);
             } else {
-              resolve(req.result.blob);
+              // Return object with blob and isBroken status
+              resolve({
+                blob: req.result.blob || null,
+                isBroken: req.result.isBroken || false
+              });
             }
           } else {
             resolve(null);
@@ -97,14 +109,17 @@ class MarvDB {
     }
   }
 
-  static async put(id, blob) {
+  /**
+   * Store entry - now accepts blob and isBroken status
+   */
+  static async put(id, blob, isBroken = false) {
     try {
       const db = await MarvDB.open();
       return new Promise((resolve, reject) => {
         const tx = db.transaction(MarvDB.STORE_NAME, "readwrite");
         const store = tx.objectStore(MarvDB.STORE_NAME);
         
-        store.put({ id, blob, created: Date.now() });
+        store.put({ id, blob, isBroken, created: Date.now() });
         
         tx.oncomplete = () => resolve(true);
         tx.onerror = () => {
@@ -1218,20 +1233,31 @@ class MarvGalleryCard extends LitElement {
 
     try {
       // 1. Check IndexedDB cache first
-      const cachedBlob = await MarvDB.get(contentId);
+      const cached = await MarvDB.get(contentId);
       
-      if (cachedBlob) {
-        // Create blob URL and track it
-        const blobUrl = URL.createObjectURL(cachedBlob);
-        this._trackBlobUrl(contentId, blobUrl);
+      if (cached) {
+        // v1.2.1: Check if it was marked as broken
+        if (cached.isBroken) {
+          sourceItem.is_broken = true;
+          sourceItem.checked = true;
+          this.requestUpdate();
+          this._finishWorker(contentId);
+          return;
+        }
         
-        sourceItem.thumbnail_blob_url = blobUrl;
-        sourceItem.checked = true;
-        sourceItem.is_broken = false;
-        
-        this.requestUpdate();
-        this._finishWorker(contentId);
-        return;
+        // Has valid thumbnail blob
+        if (cached.blob) {
+          const blobUrl = URL.createObjectURL(cached.blob);
+          this._trackBlobUrl(contentId, blobUrl);
+          
+          sourceItem.thumbnail_blob_url = blobUrl;
+          sourceItem.checked = true;
+          sourceItem.is_broken = false;
+          
+          this.requestUpdate();
+          this._finishWorker(contentId);
+          return;
+        }
       }
 
       // 2. Resolve media URL
@@ -1250,11 +1276,14 @@ class MarvGalleryCard extends LitElement {
         result = await this._checkImageDarkness(source.url, threshold);
       }
 
+      // 4. Save to IndexedDB - v1.2.1: Now includes isBroken status!
       if (result.isBad && this.config.filter_broken) {
         sourceItem.is_broken = true;
+        // Save broken status to cache (no blob, but isBroken=true)
+        await MarvDB.put(contentId, null, true);
       } else if (result.blob) {
-        // Save to IndexedDB
-        await MarvDB.put(contentId, result.blob);
+        // Save thumbnail blob (not broken)
+        await MarvDB.put(contentId, result.blob, false);
         
         // Create and track blob URL
         const blobUrl = URL.createObjectURL(result.blob);
@@ -2143,5 +2172,5 @@ window.customCards.push({
   type: "marv-gallery-card",
   name: "MarvGallery",
   preview: true,
-  description: "A high-performance media gallery by MrMarv89 with IndexedDB Caching (v1.2.0 - Fixed & Optimized)."
+  description: "A high-performance media gallery by MrMarv89 with IndexedDB Caching (v1.2.1 - Broken status cached)."
 });
