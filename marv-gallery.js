@@ -1,10 +1,13 @@
 /**
- * MarvGallery Card v1.2.1
+ * MarvGallery Card v1.2.2
  * Created by MrMarv89
  * Refactored & Fixed by Claude
  * 
  * Description:
  * A high-performance media gallery for Home Assistant.
+ * 
+ * Changelog v1.2.2:
+ * - FIX: Immediate queue refresh when broken video is filtered - no more waiting!
  * 
  * Changelog v1.2.1:
  * - FIX: Broken status (isBroken) is now cached in IndexedDB - no re-checking on reload!
@@ -1242,6 +1245,8 @@ class MarvGalleryCard extends LitElement {
           sourceItem.checked = true;
           this.requestUpdate();
           this._finishWorker(contentId);
+          // v1.2.2: Immediately check for new items that need loading
+          setTimeout(() => this._planQueueCheck(), 10);
           return;
         }
         
@@ -1281,6 +1286,12 @@ class MarvGalleryCard extends LitElement {
         sourceItem.is_broken = true;
         // Save broken status to cache (no blob, but isBroken=true)
         await MarvDB.put(contentId, null, true);
+        // v1.2.2: Immediately check for new items that need loading
+        sourceItem.checked = true;
+        this.requestUpdate();
+        this._finishWorker(contentId);
+        setTimeout(() => this._planQueueCheck(), 10);
+        return;
       } else if (result.blob) {
         // Save thumbnail blob (not broken)
         await MarvDB.put(contentId, result.blob, false);
@@ -2172,5 +2183,5 @@ window.customCards.push({
   type: "marv-gallery-card",
   name: "MarvGallery",
   preview: true,
-  description: "A high-performance media gallery by MrMarv89 with IndexedDB Caching (v1.2.1 - Broken status cached)."
+  description: "A high-performance media gallery by MrMarv89 with IndexedDB Caching (v1.2.2 - Instant filtering)."
 });
