@@ -1,10 +1,14 @@
 /**
- * MarvGallery Card v1.2.2
+ * MarvGallery Card v1.2.3
  * Created by MrMarv89
  * Refactored & Fixed by Claude
  * 
  * Description:
  * A high-performance media gallery for Home Assistant.
+ * 
+ * Changelog v1.2.3:
+ * - FIX: Thumbnails now restore when tab becomes visible again after being inactive
+ * - FIX: IndexedDB connection is checked and reconnected if browser closed it
  * 
  * Changelog v1.2.2:
  * - FIX: Immediate queue refresh when broken video is filtered - no more waiting!
@@ -36,10 +40,28 @@ class MarvDB {
 
   static _dbInstance = null;
 
+  // v1.2.3: Check if connection is still alive
+  static _isConnectionAlive() {
+    if (!MarvDB._dbInstance) return false;
+    try {
+      // Try to access objectStoreNames - throws if connection is dead
+      const _ = MarvDB._dbInstance.objectStoreNames;
+      return true;
+    } catch (e) {
+      console.warn("[MarvDB] Connection dead, will reconnect");
+      MarvDB._dbInstance = null;
+      return false;
+    }
+  }
+
   static async open() {
-    if (MarvDB._dbInstance) {
+    // v1.2.3: Check if existing connection is still valid
+    if (MarvDB._dbInstance && MarvDB._isConnectionAlive()) {
       return MarvDB._dbInstance;
     }
+    
+    // Reset instance if it was invalid
+    MarvDB._dbInstance = null;
 
     return new Promise((resolve, reject) => {
       const req = indexedDB.open(MarvDB.DB_NAME, MarvDB.VERSION);
@@ -59,6 +81,7 @@ class MarvDB {
         
         // Handle connection close
         MarvDB._dbInstance.onclose = () => {
+          console.log("[MarvDB] Connection closed by browser");
           MarvDB._dbInstance = null;
         };
         
@@ -787,12 +810,88 @@ class MarvGalleryCard extends LitElement {
     
     // Run cache cleanup on connect
     MarvDB.cleanupOldEntries();
+    
+    // v1.2.3: Handle tab visibility changes
+    this._visibilityHandler = this._handleVisibilityChange.bind(this);
+    document.addEventListener('visibilitychange', this._visibilityHandler);
   }
 
   disconnectedCallback() {
     super.disconnectedCallback();
     this._stopAutoRefresh();
     this._cleanup();
+    
+    // v1.2.3: Remove visibility handler
+    if (this._visibilityHandler) {
+      document.removeEventListener('visibilitychange', this._visibilityHandler);
+    }
+  }
+  
+  // v1.2.3: Restore thumbnails when tab becomes visible again
+  _handleVisibilityChange() {
+    if (document.visibilityState === 'visible') {
+      console.log("[MarvGallery] Tab visible again, checking thumbnails...");
+      this._restoreBlobUrls();
+    }
+  }
+  
+  // v1.2.3: Recreate blob URLs from cache for items that lost their thumbnails
+  async _restoreBlobUrls() {
+    if (!this._mediaEvents?.children) return;
+    
+    let restored = 0;
+    
+    for (const item of this._mediaEvents.children) {
+      const sourceItem = this._itemMap.get(item.media_content_id);
+      if (!sourceItem) continue;
+      
+      // Skip if not checked or broken
+      if (!sourceItem.checked || sourceItem.is_broken) continue;
+      
+      // Check if blob URL is still valid by checking if it exists
+      if (sourceItem.thumbnail_blob_url) {
+        // Test if the blob URL is still valid
+        const isValid = await this._isBlobUrlValid(sourceItem.thumbnail_blob_url);
+        if (isValid) continue;
+        
+        // Blob URL is invalid, need to restore from cache
+        console.log("[MarvGallery] Restoring thumbnail for:", item.media_content_id);
+        
+        try {
+          const cached = await MarvDB.get(item.media_content_id);
+          if (cached?.blob) {
+            // Revoke old URL
+            URL.revokeObjectURL(sourceItem.thumbnail_blob_url);
+            this._activeBlobUrls.delete(item.media_content_id);
+            
+            // Create new blob URL
+            const blobUrl = URL.createObjectURL(cached.blob);
+            this._trackBlobUrl(item.media_content_id, blobUrl);
+            sourceItem.thumbnail_blob_url = blobUrl;
+            restored++;
+          }
+        } catch (e) {
+          console.warn("[MarvGallery] Failed to restore thumbnail:", e);
+        }
+      }
+    }
+    
+    if (restored > 0) {
+      console.log(`[MarvGallery] Restored ${restored} thumbnails`);
+      this.requestUpdate();
+    }
+  }
+  
+  // v1.2.3: Check if a blob URL is still valid
+  _isBlobUrlValid(blobUrl) {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => resolve(true);
+      img.onerror = () => resolve(false);
+      // Set a timeout in case it hangs
+      setTimeout(() => resolve(false), 100);
+      img.src = blobUrl;
+    });
   }
 
   _cleanup() {
@@ -2183,5 +2282,5 @@ window.customCards.push({
   type: "marv-gallery-card",
   name: "MarvGallery",
   preview: true,
-  description: "A high-performance media gallery by MrMarv89 with IndexedDB Caching (v1.2.2 - Instant filtering)."
+  description: "A high-performance media gallery by MrMarv89 with IndexedDB Caching (v1.2.3 - Tab restore fix)."
 });
